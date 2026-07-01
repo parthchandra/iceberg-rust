@@ -40,6 +40,19 @@ use crate::spec::{
 };
 use crate::{Error, ErrorKind, Result};
 
+/// Create an Arrow Field with PARQUET_FIELD_ID_META_KEY metadata attached.
+fn field_with_id(
+    name: impl Into<String>,
+    data_type: DataType,
+    nullable: bool,
+    field_id: i32,
+) -> Field {
+    Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        field_id.to_string(),
+    )]))
+}
+
 /// Build a map of field ID to constant value (as Datum) for identity-partitioned fields.
 ///
 /// Implements Iceberg spec "Column Projection" rule #1: use partition metadata constants
@@ -209,14 +222,43 @@ enum SchemaComparison {
 
 /// Builder for RecordBatchTransformer to improve ergonomics when constructing with optional parameters.
 ///
-/// Constant fields are pre-computed for both virtual/metadata fields (like _file) and
-/// identity-partitioned fields to avoid duplicate work during batch processing.
+/// All per-file constants (scalar metadata like `_file`, identity partition values,
+/// and the `_partition` struct) are stored in a single `metadata_columns` map keyed by
+/// field_id. This unified representation (via [`MetadataColumnSource`]) means the
+/// transformer handles all constant columns through one code path.
 #[derive(Debug)]
 pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
-    constant_fields: HashMap<i32, Datum>,
-    partition_column: Option<PartitionColumnConstant>,
+    metadata_columns: HashMap<i32, MetadataColumnSource>,
+}
+
+/// Unified source for metadata/virtual column constants.
+///
+/// Both scalar metadata columns (like `_file`) and the struct `_partition` column are
+/// per-file constants synthesized during scan. This enum unifies both representations
+/// so the transformer can handle them through a single `metadata_columns` map keyed
+/// by field_id, replacing the previous split between `constant_fields: HashMap<i32, Datum>`
+/// and `partition_column: Option<PartitionColumnConstant>`.
+///
+/// # Design for #2699
+///
+/// When `_pos` is implemented (via arrow-rs RowNumber — a real source column passed through,
+/// not synthesized), it will NOT use this enum. `_pos` is not a constant and belongs in the
+/// virtual_fields / pass-through axis. This enum is exclusively for constant-per-file values.
+///
+/// The `ColumnSource` enum's `Add` and `AddStructConstant` variants map 1:1 to this enum's
+/// variants during transform generation. #2699 may collapse `ColumnSource::Add` and
+/// `ColumnSource::AddStructConstant` into a single `ColumnSource::AddMetadata { source: MetadataColumnSource }`
+/// variant, but that refactor can happen independently.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataColumnSource {
+    /// A scalar constant (e.g., `_file` path, `_spec_id`, identity partition values).
+    /// The Datum carries both the Iceberg type and the value.
+    Scalar(Datum),
+    /// A struct constant (the `_partition` column). Each child is a primitive constant
+    /// or null (for partition evolution gaps).
+    Struct(PartitionColumnConstant),
 }
 
 /// Pre-computed data for the _partition struct constant.
@@ -228,6 +270,27 @@ pub struct PartitionColumnConstant {
     pub child_values: Vec<Option<PrimitiveLiteral>>,
 }
 
+impl PartitionColumnConstant {
+    /// Create a new PartitionColumnConstant, validating that fields and child_values have
+    /// the same length.
+    pub fn new(fields: Fields, child_values: Vec<Option<PrimitiveLiteral>>) -> Result<Self> {
+        if fields.len() != child_values.len() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "PartitionColumnConstant: fields length ({}) != child_values length ({})",
+                    fields.len(),
+                    child_values.len()
+                ),
+            ));
+        }
+        Ok(Self {
+            fields,
+            child_values,
+        })
+    }
+}
+
 impl RecordBatchTransformerBuilder {
     pub(crate) fn new(
         snapshot_schema: Arc<IcebergSchema>,
@@ -236,19 +299,15 @@ impl RecordBatchTransformerBuilder {
         Self {
             snapshot_schema,
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
-            constant_fields: HashMap::new(),
-            partition_column: None,
+            metadata_columns: HashMap::new(),
         }
     }
 
-    /// Add a constant value for a specific field ID.
+    /// Add a scalar constant value for a specific field ID.
     /// This is used for virtual/metadata fields like _file that have constant values per batch.
-    ///
-    /// # Arguments
-    /// * `field_id` - The field ID to associate with the constant
-    /// * `datum` - The constant value (with type) for this field
     pub(crate) fn with_constant(mut self, field_id: i32, datum: Datum) -> Self {
-        self.constant_fields.insert(field_id, datum);
+        self.metadata_columns
+            .insert(field_id, MetadataColumnSource::Scalar(datum));
         self
     }
 
@@ -256,19 +315,18 @@ impl RecordBatchTransformerBuilder {
     ///
     /// Both partition_spec and partition_data must be provided together since the spec defines
     /// which fields are identity-partitioned, and the data provides their constant values.
-    /// This method computes the partition constants and merges them into constant_fields.
+    /// This method computes the partition constants and merges them into metadata_columns.
     pub(crate) fn with_partition(
         mut self,
         partition_spec: Arc<PartitionSpec>,
         partition_data: Struct,
     ) -> Result<Self> {
-        // Compute partition constants for identity-transformed fields (already returns Datum)
         let partition_constants =
             constants_map(&partition_spec, &partition_data, &self.snapshot_schema)?;
 
-        // Add partition constants to constant_fields
         for (field_id, datum) in partition_constants {
-            self.constant_fields.insert(field_id, datum);
+            self.metadata_columns
+                .insert(field_id, MetadataColumnSource::Scalar(datum));
         }
 
         Ok(self)
@@ -278,12 +336,7 @@ impl RecordBatchTransformerBuilder {
     ///
     /// This builds the struct constant for the _partition column from the unified partition
     /// type (across all specs) and the current file's partition data.
-    ///
-    /// # Arguments
-    /// * `unified_partition_type` - The unified partition type across all specs
-    /// * `partition_spec` - The partition spec for this specific file
-    /// * `partition_data` - The partition values for this file
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn with_partition_column(
         mut self,
         unified_partition_type: &StructType,
@@ -295,7 +348,10 @@ impl RecordBatchTransformerBuilder {
             partition_spec,
             partition_data,
         )?;
-        self.partition_column = Some(partition_column);
+        self.metadata_columns.insert(
+            RESERVED_FIELD_ID_PARTITION,
+            MetadataColumnSource::Struct(partition_column),
+        );
         Ok(self)
     }
 
@@ -304,7 +360,10 @@ impl RecordBatchTransformerBuilder {
         mut self,
         partition_column: PartitionColumnConstant,
     ) -> Self {
-        self.partition_column = Some(partition_column);
+        self.metadata_columns.insert(
+            RESERVED_FIELD_ID_PARTITION,
+            MetadataColumnSource::Struct(partition_column),
+        );
         self
     }
 
@@ -312,8 +371,7 @@ impl RecordBatchTransformerBuilder {
         RecordBatchTransformer {
             snapshot_schema: self.snapshot_schema,
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
-            constant_fields: self.constant_fields,
-            partition_column: self.partition_column,
+            metadata_columns: self.metadata_columns,
             batch_transform: None,
         }
     }
@@ -353,12 +411,8 @@ impl RecordBatchTransformerBuilder {
 pub(crate) struct RecordBatchTransformer {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
-    // Pre-computed constant field information: field_id -> Datum
-    // Includes both virtual/metadata fields (like _file) and identity-partitioned fields
-    // Datum holds both the Iceberg type and the value
-    constant_fields: HashMap<i32, Datum>,
-    // Pre-computed _partition struct constant
-    partition_column: Option<PartitionColumnConstant>,
+    // Unified map of all per-file constant columns (metadata, identity partition, _partition struct).
+    metadata_columns: HashMap<i32, MetadataColumnSource>,
 
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
@@ -400,8 +454,7 @@ impl RecordBatchTransformer {
                     record_batch.schema_ref(),
                     self.snapshot_schema.as_ref(),
                     &self.projected_iceberg_field_ids,
-                    &self.constant_fields,
-                    &self.partition_column,
+                    &self.metadata_columns,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -420,8 +473,7 @@ impl RecordBatchTransformer {
         source_schema: &ArrowSchemaRef,
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],
-        constant_fields: &HashMap<i32, Datum>,
-        partition_column: &Option<PartitionColumnConstant>,
+        metadata_columns: &HashMap<i32, MetadataColumnSource>,
     ) -> Result<BatchTransform> {
         let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
         let field_id_to_mapped_schema_map =
@@ -432,63 +484,50 @@ impl RecordBatchTransformer {
         let fields: Result<Vec<_>> = projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
-                // Handle _partition struct column
-                if *field_id == RESERVED_FIELD_ID_PARTITION
-                    && let Some(pc) = partition_column
-                {
-                    let struct_type = DataType::Struct(pc.fields.clone());
-                    let nullable = pc.fields.is_empty();
-                    let arrow_field =
-                        Field::new(RESERVED_COL_NAME_PARTITION, struct_type, nullable)
-                            .with_metadata(HashMap::from([(
-                                PARQUET_FIELD_ID_META_KEY.to_string(),
-                                RESERVED_FIELD_ID_PARTITION.to_string(),
-                            )]));
-                    return Ok(Arc::new(arrow_field));
-                }
-
-                // Check if this is a constant field
-                if constant_fields.contains_key(field_id) {
-                    // For metadata/virtual fields (like _file), get name from metadata_columns
-                    // For partition fields, get name from schema (they exist in schema)
-                    if let Ok(iceberg_field) = get_metadata_field(*field_id) {
-                        // This is a metadata/virtual field - convert Iceberg field to Arrow
-                        let datum = constant_fields.get(field_id).ok_or(Error::new(
-                            ErrorKind::Unexpected,
-                            "constant field not found",
-                        ))?;
-                        let arrow_type = datum_to_arrow_type_with_ree(datum);
-                        let arrow_field =
-                            Field::new(&iceberg_field.name, arrow_type, !iceberg_field.required)
-                                .with_metadata(HashMap::from([(
-                                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                                    iceberg_field.id.to_string(),
-                                )]));
+                match metadata_columns.get(field_id) {
+                    Some(MetadataColumnSource::Struct(pc)) => {
+                        let struct_type = DataType::Struct(pc.fields.clone());
+                        let nullable = pc.fields.is_empty();
+                        let arrow_field = field_with_id(
+                            RESERVED_COL_NAME_PARTITION,
+                            struct_type,
+                            nullable,
+                            *field_id,
+                        );
                         Ok(Arc::new(arrow_field))
-                    } else {
-                        // This is a partition constant field (exists in schema but uses constant value)
-                        let field = &field_id_to_mapped_schema_map
+                    }
+                    Some(MetadataColumnSource::Scalar(datum)) => {
+                        if let Ok(iceberg_field) = get_metadata_field(*field_id) {
+                            // Metadata/virtual field (like _file)
+                            let arrow_type = datum_to_arrow_type_with_ree(datum);
+                            let arrow_field = field_with_id(
+                                &iceberg_field.name,
+                                arrow_type,
+                                !iceberg_field.required,
+                                iceberg_field.id,
+                            );
+                            Ok(Arc::new(arrow_field))
+                        } else {
+                            // Identity partition constant (exists in schema)
+                            let field = &field_id_to_mapped_schema_map
+                                .get(field_id)
+                                .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
+                                .0;
+                            let arrow_type = datum_to_arrow_type_with_ree(datum);
+                            let constant_field =
+                                Field::new(field.name(), arrow_type, field.is_nullable())
+                                    .with_metadata(field.metadata().clone());
+                            Ok(Arc::new(constant_field))
+                        }
+                    }
+                    None => {
+                        // Regular field - use schema as-is
+                        Ok(field_id_to_mapped_schema_map
                             .get(field_id)
                             .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
-                            .0;
-                        let datum = constant_fields.get(field_id).ok_or(Error::new(
-                            ErrorKind::Unexpected,
-                            "constant field not found",
-                        ))?;
-                        let arrow_type = datum_to_arrow_type_with_ree(datum);
-                        // Use the type from constant_fields (REE for constants)
-                        let constant_field =
-                            Field::new(field.name(), arrow_type, field.is_nullable())
-                                .with_metadata(field.metadata().clone());
-                        Ok(Arc::new(constant_field))
+                            .0
+                            .clone())
                     }
-                } else {
-                    // Regular field - use schema as-is
-                    Ok(field_id_to_mapped_schema_map
-                        .get(field_id)
-                        .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
-                        .0
-                        .clone())
                 }
             })
             .collect();
@@ -504,8 +543,7 @@ impl RecordBatchTransformer {
                     snapshot_schema,
                     projected_iceberg_field_ids,
                     field_id_to_mapped_schema_map,
-                    constant_fields,
-                    partition_column,
+                    metadata_columns,
                 )?,
                 target_schema,
             }),
@@ -562,8 +600,7 @@ impl RecordBatchTransformer {
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],
         field_id_to_mapped_schema_map: HashMap<i32, (FieldRef, usize)>,
-        constant_fields: &HashMap<i32, Datum>,
-        partition_column: &Option<PartitionColumnConstant>,
+        metadata_columns: &HashMap<i32, MetadataColumnSource>,
     ) -> Result<Vec<ColumnSource>> {
         let field_id_to_source_schema_map =
             Self::build_field_id_to_arrow_schema_map(source_schema)?;
@@ -571,26 +608,21 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
-                // Handle _partition struct column
-                if *field_id == RESERVED_FIELD_ID_PARTITION
-                    && let Some(pc) = partition_column
-                {
-                    return Ok(ColumnSource::AddStructConstant {
-                        fields: pc.fields.clone(),
-                        child_values: pc.child_values.clone(),
-                    });
-                }
-
-                // Check if this is a constant field (metadata/virtual or identity-partitioned)
-                // Constant fields always use their pre-computed constant values, regardless of whether
-                // they exist in the Parquet file. This is per Iceberg spec rule #1: partition metadata
-                // is authoritative and should be preferred over file data.
-                if let Some(datum) = constant_fields.get(field_id) {
-                    let arrow_type = datum_to_arrow_type_with_ree(datum);
-                    return Ok(ColumnSource::Add {
-                        value: Some(datum.literal().clone()),
-                        target_type: arrow_type,
-                    });
+                match metadata_columns.get(field_id) {
+                    Some(MetadataColumnSource::Struct(pc)) => {
+                        return Ok(ColumnSource::AddStructConstant {
+                            fields: pc.fields.clone(),
+                            child_values: pc.child_values.clone(),
+                        });
+                    }
+                    Some(MetadataColumnSource::Scalar(datum)) => {
+                        let arrow_type = datum_to_arrow_type_with_ree(datum);
+                        return Ok(ColumnSource::Add {
+                            value: Some(datum.literal().clone()),
+                            target_type: arrow_type,
+                        });
+                    }
+                    None => {}
                 }
 
                 let (target_field, _) =
@@ -783,16 +815,19 @@ impl RecordBatchTransformer {
             })
             .collect::<Result<_>>()?;
 
-        Ok(Arc::new(StructArray::new(
+        Ok(Arc::new(StructArray::try_new(
             fields.clone(),
             child_arrays,
             None,
-        )))
+        )?))
     }
 }
 
 /// Builds a [`PartitionColumnConstant`] from the unified partition type and a file's
 /// partition spec/data.
+///
+/// If `unified_partition_type` has no fields (unpartitioned table), returns an empty constant
+/// that renders as a null struct column.
 ///
 /// For each field in the unified partition type:
 /// - If it corresponds to a field in this file's partition spec, use the value from partition_data
@@ -802,6 +837,11 @@ pub fn build_partition_column_constant(
     partition_spec: &PartitionSpec,
     partition_data: &Struct,
 ) -> Result<PartitionColumnConstant> {
+    // Unpartitioned table: empty struct rendered as null
+    if unified_partition_type.fields().is_empty() {
+        return PartitionColumnConstant::new(Fields::empty(), vec![]);
+    }
+
     use crate::arrow::type_to_arrow_type;
 
     let spec_fields = partition_spec.fields();
@@ -835,10 +875,7 @@ pub fn build_partition_column_constant(
         child_values.push(value);
     }
 
-    Ok(PartitionColumnConstant {
-        fields: Fields::from(arrow_fields),
-        child_values,
-    })
+    PartitionColumnConstant::new(Fields::from(arrow_fields), child_values)
 }
 
 #[cfg(test)]

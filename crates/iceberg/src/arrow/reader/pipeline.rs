@@ -34,9 +34,7 @@ use super::{
 use crate::arrow::build_partition_column_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
-use crate::arrow::record_batch_transformer::{
-    PartitionColumnConstant, RecordBatchTransformerBuilder,
-};
+use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
@@ -44,7 +42,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_PARTITION, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::Datum;
+use crate::spec::{Datum, PartitionSpec, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -267,21 +265,15 @@ impl FileScanTaskReader {
             .contains(&RESERVED_FIELD_ID_PARTITION)
             && let Some(unified_type) = &task.unified_partition_type
         {
-            if unified_type.fields().is_empty() {
-                // Unpartitioned table: empty struct rendered as null
-                let empty_constant = PartitionColumnConstant {
-                    fields: arrow_schema::Fields::empty(),
-                    child_values: vec![],
-                };
-                record_batch_transformer_builder = record_batch_transformer_builder
-                    .with_partition_column_precomputed(empty_constant);
-            } else if let (Some(spec), Some(partition_data)) =
-                (&task.partition_spec, &task.partition)
-            {
-                let constant = build_partition_column_constant(unified_type, spec, partition_data)?;
-                record_batch_transformer_builder =
-                    record_batch_transformer_builder.with_partition_column_precomputed(constant);
-            }
+            let (spec, partition_data) = match (&task.partition_spec, &task.partition) {
+                (Some(spec), Some(data)) => (spec.clone(), data.clone()),
+                // Unpartitioned table or missing spec: build_partition_column_constant
+                // handles the empty unified_type case with an early return.
+                _ => (Arc::new(PartitionSpec::unpartition_spec()), Struct::empty()),
+            };
+            let constant = build_partition_column_constant(unified_type, &spec, &partition_data)?;
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_partition_column_precomputed(constant);
         }
 
         let mut record_batch_transformer = record_batch_transformer_builder.build();

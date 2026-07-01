@@ -17,6 +17,9 @@
 
 //! Partition type utilities for Iceberg tables.
 
+use std::cmp::Reverse;
+use std::collections::HashSet;
+
 use crate::spec::{NestedField, NestedFieldRef, PartitionSpec, Schema, StructType, Transform};
 use crate::{Error, ErrorKind, Result};
 
@@ -39,19 +42,24 @@ pub fn compute_unified_partition_type<'a>(
     partition_specs: impl Iterator<Item = &'a PartitionSpec>,
     schema: &Schema,
 ) -> Result<StructType> {
-    let mut seen_field_ids = std::collections::HashSet::new();
+    let mut seen_field_ids = HashSet::new();
     let mut struct_fields: Vec<NestedFieldRef> = Vec::new();
 
     // Sort specs by spec_id descending (newer first) to match Java's behavior:
     // newer field names take precedence when deduplicating by field_id.
     let mut specs: Vec<&PartitionSpec> = partition_specs.collect();
-    specs.sort_by_key(|s| std::cmp::Reverse(s.spec_id()));
+    specs.sort_by_key(|s| Reverse(s.spec_id()));
 
     for spec in specs {
         for field in spec.fields() {
             if seen_field_ids.contains(&field.field_id) {
                 continue;
             }
+
+            // Claim this field_id for the current (newest) spec, even if it's void.
+            // This ensures that if a newer spec marks a field Void, an older spec
+            // won't re-add it with a stale name.
+            seen_field_ids.insert(field.field_id);
 
             // Skip void transforms (dropped partition columns)
             if matches!(field.transform, Transform::Void) {
@@ -72,23 +80,22 @@ pub fn compute_unified_partition_type<'a>(
                 ));
             }
 
-            seen_field_ids.insert(field.field_id);
-
-            let source_field = schema.field_by_id(field.source_id).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!(
-                        "No column with source column id {} in schema for partition field {}",
-                        field.source_id, field.name
-                    ),
-                )
-            })?;
+            // Skip fields whose source column was dropped (partition evolution
+            // allows dropping columns; Java's Partitioning.partitionType skips these).
+            let source_field = match schema.field_by_id(field.source_id) {
+                Some(f) => f,
+                None => continue,
+            };
 
             let res_type = field.transform.result_type(&source_field.field_type)?;
             let nested = NestedField::optional(field.field_id, &field.name, res_type).into();
             struct_fields.push(nested);
         }
     }
+
+    // Sort by field ID ascending to match Java's buildPartitionProjectionType
+    // which sorts by fieldMap.keySet().stream().sorted(Comparator.naturalOrder()).
+    struct_fields.sort_by_key(|f| f.id);
 
     Ok(StructType::new(struct_fields))
 }
