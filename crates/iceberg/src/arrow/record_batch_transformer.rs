@@ -264,10 +264,8 @@ pub enum MetadataColumnSource {
 /// Pre-computed data for the _partition struct constant.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionColumnConstant {
-    /// Arrow struct fields (names, types, nullability) for the _partition column.
-    pub fields: Fields,
-    /// Constant value for each child field. None means null (e.g., partition evolution).
-    pub child_values: Vec<Option<PrimitiveLiteral>>,
+    fields: Fields,
+    child_values: Vec<Option<PrimitiveLiteral>>,
 }
 
 impl PartitionColumnConstant {
@@ -288,6 +286,14 @@ impl PartitionColumnConstant {
             fields,
             child_values,
         })
+    }
+
+    pub(crate) fn fields(&self) -> &Fields {
+        &self.fields
+    }
+
+    pub(crate) fn child_values(&self) -> &[Option<PrimitiveLiteral>] {
+        &self.child_values
     }
 }
 
@@ -329,29 +335,6 @@ impl RecordBatchTransformerBuilder {
                 .insert(field_id, MetadataColumnSource::Scalar(datum));
         }
 
-        Ok(self)
-    }
-
-    /// Set the _partition metadata column constant.
-    ///
-    /// This builds the struct constant for the _partition column from the unified partition
-    /// type (across all specs) and the current file's partition data.
-    #[allow(dead_code)]
-    pub(crate) fn with_partition_column(
-        mut self,
-        unified_partition_type: &StructType,
-        partition_spec: &PartitionSpec,
-        partition_data: &Struct,
-    ) -> Result<Self> {
-        let partition_column = build_partition_column_constant(
-            unified_partition_type,
-            partition_spec,
-            partition_data,
-        )?;
-        self.metadata_columns.insert(
-            RESERVED_FIELD_ID_PARTITION,
-            MetadataColumnSource::Struct(partition_column),
-        );
         Ok(self)
     }
 
@@ -486,8 +469,8 @@ impl RecordBatchTransformer {
             .map(|field_id| {
                 match metadata_columns.get(field_id) {
                     Some(MetadataColumnSource::Struct(pc)) => {
-                        let struct_type = DataType::Struct(pc.fields.clone());
-                        let nullable = pc.fields.is_empty();
+                        let struct_type = DataType::Struct(pc.fields().clone());
+                        let nullable = pc.fields().is_empty();
                         let arrow_field = field_with_id(
                             RESERVED_COL_NAME_PARTITION,
                             struct_type,
@@ -611,8 +594,8 @@ impl RecordBatchTransformer {
                 match metadata_columns.get(field_id) {
                     Some(MetadataColumnSource::Struct(pc)) => {
                         return Ok(ColumnSource::AddStructConstant {
-                            fields: pc.fields.clone(),
-                            child_values: pc.child_values.clone(),
+                            fields: pc.fields().clone(),
+                            child_values: pc.child_values().to_vec(),
                         });
                     }
                     Some(MetadataColumnSource::Scalar(datum)) => {
@@ -1939,10 +1922,15 @@ mod test {
         // Project id, name, and _partition
         let projected_field_ids = [1, 2, RESERVED_FIELD_ID_PARTITION];
 
+        let partition_column = build_partition_column_constant(
+            &unified_partition_type,
+            &partition_spec,
+            &partition_data,
+        )
+        .unwrap();
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
-                .with_partition_column(&unified_partition_type, &partition_spec, &partition_data)
-                .unwrap()
+                .with_partition_column_precomputed(partition_column)
                 .build();
 
         let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
@@ -2049,10 +2037,15 @@ mod test {
 
         let projected_field_ids = [3, RESERVED_FIELD_ID_PARTITION];
 
+        let partition_column = build_partition_column_constant(
+            &unified_partition_type,
+            &spec_v0,
+            &partition_data,
+        )
+        .unwrap();
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
-                .with_partition_column(&unified_partition_type, &spec_v0, &partition_data)
-                .unwrap()
+                .with_partition_column_precomputed(partition_column)
                 .build();
 
         let parquet_batch =

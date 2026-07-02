@@ -139,7 +139,10 @@ impl ManifestEntryContext {
             )
             .with_deletes(deletes)
             .with_partition(Some(self.manifest_entry.data_file.partition.clone()))
-            // TODO: Pass actual PartitionSpec through context chain for native flow
+            // TODO(#2695): Wire real PartitionSpec here. Requires passing table_metadata
+            // through the context chain to look up partition_spec_by_id. Deferred because
+            // existing scan tests have partition metadata that doesn't match file data,
+            // and fixing them is out of scope for this PR.
             .with_partition_spec(None)
             .with_name_mapping(self.name_mapping)
             .with_unified_partition_type(self.unified_partition_type.clone())
