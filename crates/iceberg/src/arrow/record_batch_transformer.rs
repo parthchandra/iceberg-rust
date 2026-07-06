@@ -2038,12 +2038,9 @@ mod test {
 
         let projected_field_ids = [3, RESERVED_FIELD_ID_PARTITION];
 
-        let partition_column = build_partition_column_constant(
-            &unified_partition_type,
-            &spec_v0,
-            &partition_data,
-        )
-        .unwrap();
+        let partition_column =
+            build_partition_column_constant(&unified_partition_type, &spec_v0, &partition_data)
+                .unwrap();
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
                 .with_partition_column_precomputed(partition_column)
