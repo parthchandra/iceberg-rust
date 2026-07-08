@@ -40,7 +40,8 @@ use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
-    RESERVED_COL_NAME_POS, RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, is_metadata_field,
+    RESERVED_COL_NAME_POS, RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS,
+    RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::Datum;
@@ -279,6 +280,15 @@ impl FileScanTaskReader {
             let file_datum = Datum::string(task.data_file_path.clone());
             record_batch_transformer_builder =
                 record_batch_transformer_builder.with_constant(RESERVED_FIELD_ID_FILE, file_datum);
+        }
+
+        if task
+            .project_field_ids()
+            .contains(&RESERVED_FIELD_ID_SPEC_ID)
+        {
+            let spec_id_datum = Datum::int(task.partition_spec.clone().unwrap().spec_id());
+            record_batch_transformer_builder = record_batch_transformer_builder
+                .with_constant(RESERVED_FIELD_ID_SPEC_ID, spec_id_datum);
         }
 
         if let (Some(partition_spec), Some(partition_data)) =
